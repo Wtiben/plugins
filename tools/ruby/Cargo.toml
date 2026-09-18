@@ -1,6 +1,6 @@
 [package]
 name = "ruby_tool"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2024"
 description = "Ruby WASM plugin for proto."
 authors = ["Miles Johnson"]
@@ -21,6 +21,8 @@ crate-type = ["cdylib", "lib"]
 tool_common = { path = "../../crates/tool-common" }
 extism-pdk = { workspace = true }
 proto_pdk = { workspace = true }
+proto_pdk_api = { workspace = true }
+schematic = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

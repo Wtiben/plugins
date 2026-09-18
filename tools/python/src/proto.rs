@@ -1,15 +1,17 @@
-use crate::version::from_python_version;
+use crate::config::PythonToolConfig;
+use crate::version::{from_python_tag, from_python_version, to_python_version};
 use extism_pdk::*;
 use proto_pdk::*;
 use regex::Regex;
-use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
-use tool_common::enable_tracing;
+use schematic::SchemaBuilder;
+use std::collections::{HashMap, HashSet};
+use tool_common::{enable_tracing, registry::*};
 
 #[host_fn]
 extern "ExtismHost" {
     fn exec_command(input: Json<ExecCommandInput>) -> Json<ExecCommandOutput>;
     fn host_log(input: Json<HostLogInput>);
+    fn send_request(input: Json<SendRequestInput>) -> Json<SendRequestOutput>;
 }
 
 static NAME: &str = "Python";
@@ -28,6 +30,13 @@ pub fn register_tool(Json(_): Json<RegisterToolInput>) -> FnResult<Json<Register
 }
 
 #[plugin_fn]
+pub fn define_tool_config(_: ()) -> FnResult<Json<DefineToolConfigOutput>> {
+    Ok(Json(DefineToolConfigOutput {
+        schema: SchemaBuilder::build_root::<PythonToolConfig>(),
+    }))
+}
+
+#[plugin_fn]
 pub fn detect_version_files(_: ()) -> FnResult<Json<DetectVersionOutput>> {
     Ok(Json(DetectVersionOutput {
         files: vec![".python-version".into()],
@@ -37,24 +46,63 @@ pub fn detect_version_files(_: ()) -> FnResult<Json<DetectVersionOutput>> {
 
 #[plugin_fn]
 pub fn load_versions(Json(_): Json<LoadVersionsInput>) -> FnResult<Json<LoadVersionsOutput>> {
-    let tags = load_git_tags("https://github.com/python/cpython")?;
+    let env = get_host_environment()?;
     let regex = Regex::new(
         r"v?(?<major>[0-9]+)\.(?<minor>[0-9]+)(?:\.(?<patch>[0-9]+))?(?:(?<pre>a|b|c|rc)(?<preid>[0-9]+))?",
     )
     .unwrap();
 
-    let tags = tags
+    let tags = load_git_tags("https://github.com/python/cpython")?
         .into_iter()
         .filter_map(|tag| {
             if tag == "legacy-trunk" {
                 None
             } else {
-                from_python_version(tag, &regex)
+                from_python_tag(tag, &regex)
             }
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(LoadVersionsOutput::from(tags)?))
+    let mut output = LoadVersionsOutput::from(tags)?;
+    let mut versions = HashSet::<VersionSpec>::from_iter(output.versions);
+
+    // Include our build specific versions, as these are not official
+    versions.extend(fetch_versions(env, "python", true)?);
+
+    output.versions = versions.into_iter().collect();
+
+    Ok(Json(output))
+}
+
+#[plugin_fn]
+pub fn resolve_version(
+    Json(input): Json<ResolveVersionInput>,
+) -> FnResult<Json<ResolveVersionOutput>> {
+    let config = get_tool_config::<PythonToolConfig>()?;
+    let mut output = ResolveVersionOutput::default();
+
+    let UnresolvedVersionSpec::Version(initial) = &input.initial else {
+        return Ok(Json(output));
+    };
+
+    // Normalize prereleases to the registry format
+    let version = Version::parse(from_python_version(&initial.to_string()))?;
+
+    if &version != initial {
+        output.candidate = Some(UnresolvedVersionSpec::Version(version.clone()));
+    }
+
+    // If we have a full semantic version without a build,
+    // fetch the available release and see if we have a build to use
+    if config.use_latest_build
+        && version.build.is_none()
+        && let Ok(release) = fetch_release("python", &version)
+        && let Some(build_id) = release.builds.keys().next()
+    {
+        output.version = Some(VersionSpec::parse(format!("{version}+{build_id}"))?);
+    }
+
+    Ok(Json(output))
 }
 
 #[plugin_fn]
@@ -68,15 +116,10 @@ pub fn build_instructions(
         return Err(PluginError::UnsupportedWindowsBuild.into());
     }
 
-    // check_supported_os_and_arch(
-    //     NAME,
-    //     &env,
-    //     permutations! [
-    //         HostOS::Linux => [HostArch::X86, HostArch::X64, HostArch::Arm, HostArch::Arm64, HostArch::S390x, HostArch::Riscv64, HostArch::Powerpc64],
-    //         HostOS::MacOS => [HostArch::X64, HostArch::Arm64],
-    //         // HostOS::Windows => [HostArch::X86, HostArch::X64],
-    //     ],
-    // )?;
+    let python_version = match version.as_version() {
+        Some(version) => to_python_version(version),
+        None => version.to_string(),
+    };
 
     let output = BuildInstructionsOutput {
         help_url: Some(
@@ -133,7 +176,7 @@ pub fn build_instructions(
             })),
             BuildInstruction::RunCommand(Box::new(CommandInstruction::with_builder(
                 "python-build",
-                ["--verbose", version.to_string().as_str(), "."],
+                ["--verbose", python_version.as_str(), "."],
             ))),
         ],
         ..Default::default()
@@ -142,66 +185,51 @@ pub fn build_instructions(
     Ok(Json(output))
 }
 
-#[derive(Deserialize)]
-struct ReleaseEntry {
-    release: String,
-    file: String,
-    #[serde(default)]
-    sha: u8,
-}
-
 #[plugin_fn]
 pub fn download_prebuilt(
     Json(input): Json<DownloadPrebuiltInput>,
 ) -> FnResult<Json<DownloadPrebuiltOutput>> {
     let env = get_host_environment()?;
-    let version = &input.context.version;
+    let spec = &input.context.version;
 
-    if version.is_canary() {
+    if spec.is_canary() {
         return Err(plugin_err!(PluginError::UnsupportedCanary {
             tool: NAME.into()
         }));
     }
 
-    let releases: BTreeMap<Version, BTreeMap<String, ReleaseEntry>> = fetch_json(
-        "https://raw.githubusercontent.com/moonrepo/plugins/master/tools/python/releases-v2.json",
-    )?;
-
-    let Some(release_triples) = version.as_version().and_then(|v| releases.get(v)) else {
-        return Err(plugin_err!(
-            "No pre-built available for version <hash>{version}</hash> (via <url>https://github.com/astral-sh/python-build-standalone</url>)! Try building from source with <shell>--build</shell>.",
-        ));
+    let make_error = || {
+        plugin_err!(
+            "No pre-built available for <hash>{spec}</hash> on <id>{}-{}</id> (via <url>https://github.com/astral-sh/python-build-standalone</url>)! Try building from source with <shell>--build</shell>.",
+            env.os,
+            env.arch,
+        )
     };
 
-    let triple = get_target_triple(env, NAME)?;
-
-    let Some(release) = release_triples.get(&triple) else {
-        return Err(plugin_err!(
-            "No pre-built available for architecture <id>{triple}</id>! Try building from source with <shell>--build</shell>."
-        ));
+    let Some(version) = spec.as_version() else {
+        return Err(make_error());
     };
 
-    let url_prefix = format!(
-        "https://github.com/astral-sh/python-build-standalone/releases/download/{}",
-        release.release
-    );
+    let release = fetch_release("python", version)?;
 
-    Ok(Json(DownloadPrebuiltOutput {
-        archive_prefix: Some(if release.file.contains("install_only") {
+    let Some(mut output) = release.create_download_prebuilt(env, version) else {
+        return Err(make_error());
+    };
+
+    // Older releases are not "install only" and nest the files in a sub-folder
+    output.archive_prefix = Some(
+        if output
+            .download_name
+            .as_ref()
+            .is_some_and(|name| name.contains("install_only"))
+        {
             "python".into()
         } else {
             "python/install".into()
-        }),
-        checksum_url: if release.sha == 1 {
-            Some(format!("{url_prefix}/SHA256SUMS"))
-        } else if release.sha == 2 {
-            Some(format!("{url_prefix}/{}.sha256", release.file))
-        } else {
-            None
         },
-        download_url: format!("{url_prefix}/{}", release.file),
-        ..Default::default()
-    }))
+    );
+
+    Ok(Json(output))
 }
 
 #[plugin_fn]
