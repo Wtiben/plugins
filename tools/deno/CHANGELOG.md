@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.12
+
+#### 🚀 Updates
+
+- Added `package.json` `devEngines.runtime` support for version detection, pinning, and unpinning.
+
 ## 0.15.11
 
 #### 🚀 Updates

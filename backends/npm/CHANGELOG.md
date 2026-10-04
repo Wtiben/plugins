@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+#### 🐞 Fixes
+
+- Fixed loading versions failing with npm v12, as `npm view --json` now wraps objects in an array.
+
 ## 0.1.3
 
 #### 🚀 Updates

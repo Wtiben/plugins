@@ -21,6 +21,7 @@ const CMD_SHIM_TEMPLATE: &str = include_str!("../templates/cmd-shim.cmd");
 extern "ExtismHost" {
     fn exec_command(input: Json<ExecCommandInput>) -> Json<ExecCommandOutput>;
     fn get_env_var(key: &str) -> String;
+    fn send_request(input: Json<SendRequestInput>) -> Json<SendRequestOutput>;
 }
 
 #[plugin_fn]
@@ -388,17 +389,8 @@ pub fn download_prebuilt(
             }
         };
 
-        let libc = if env.os.is_linux() {
-            if env.libc == HostLibc::Musl {
-                "-musl"
-            } else {
-                return Err(plugin_err!(PluginError::Message(
-                    "Only musl is supported.".into()
-                )));
-            }
-        } else {
-            ""
-        };
+        // Yarn only publishes musl builds for Linux, and they also run on glibc hosts.
+        let libc = if env.os.is_linux() { "-musl" } else { "" };
 
         let filename = format!("yarn-{arch}-{os}{libc}.zip");
 

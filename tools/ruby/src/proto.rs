@@ -1,12 +1,15 @@
-use crate::releases::*;
+use crate::config::RubyToolConfig;
+use crate::version::*;
 use extism_pdk::*;
 use proto_pdk::*;
-use std::collections::HashMap;
-use tool_common::enable_tracing;
+use schematic::SchemaBuilder;
+use std::collections::{HashMap, HashSet};
+use tool_common::{enable_tracing, registry::*};
 
 #[host_fn]
 extern "ExtismHost" {
     fn exec_command(input: Json<ExecCommandInput>) -> Json<ExecCommandOutput>;
+    fn send_request(input: Json<SendRequestInput>) -> Json<SendRequestOutput>;
 }
 
 #[plugin_fn]
@@ -25,6 +28,13 @@ pub fn register_tool(Json(_): Json<RegisterToolInput>) -> FnResult<Json<Register
 }
 
 #[plugin_fn]
+pub fn define_tool_config(_: ()) -> FnResult<Json<DefineToolConfigOutput>> {
+    Ok(Json(DefineToolConfigOutput {
+        schema: SchemaBuilder::build_root::<RubyToolConfig>(),
+    }))
+}
+
+#[plugin_fn]
 pub fn detect_version_files(_: ()) -> FnResult<Json<DetectVersionOutput>> {
     Ok(Json(DetectVersionOutput {
         files: vec![".ruby-version".into()],
@@ -34,6 +44,8 @@ pub fn detect_version_files(_: ()) -> FnResult<Json<DetectVersionOutput>> {
 
 #[plugin_fn]
 pub fn load_versions(Json(_): Json<LoadVersionsInput>) -> FnResult<Json<LoadVersionsOutput>> {
+    let env = get_host_environment()?;
+
     let tags = load_git_tags("https://github.com/ruby/ruby")?
         .into_iter()
         .filter_map(|tag| {
@@ -47,7 +59,7 @@ pub fn load_versions(Json(_): Json<LoadVersionsInput>) -> FnResult<Json<LoadVers
                 if version.starts_with('0') || version.starts_with('1') {
                     None
                 } else {
-                    Some(version)
+                    Some(from_ruby_version(&version))
                 }
             } else {
                 None
@@ -55,7 +67,46 @@ pub fn load_versions(Json(_): Json<LoadVersionsInput>) -> FnResult<Json<LoadVers
         })
         .collect::<Vec<_>>();
 
-    Ok(Json(LoadVersionsOutput::from(tags)?))
+    let mut output = LoadVersionsOutput::from(tags)?;
+    let mut versions = HashSet::<VersionSpec>::from_iter(output.versions);
+
+    // Include our build specific versions, as these are not official
+    versions.extend(fetch_versions(env, "ruby", true)?);
+
+    output.versions = versions.into_iter().collect();
+
+    Ok(Json(output))
+}
+
+#[plugin_fn]
+pub fn resolve_version(
+    Json(input): Json<ResolveVersionInput>,
+) -> FnResult<Json<ResolveVersionOutput>> {
+    let config = get_tool_config::<RubyToolConfig>()?;
+    let mut output = ResolveVersionOutput::default();
+
+    let UnresolvedVersionSpec::Version(initial) = &input.initial else {
+        return Ok(Json(output));
+    };
+
+    // Normalize prereleases to the registry format
+    let version = Version::parse(from_ruby_version(&initial.to_string()))?;
+
+    if &version != initial {
+        output.candidate = Some(UnresolvedVersionSpec::Version(version.clone()));
+    }
+
+    // If we have a full semantic version without a build,
+    // fetch the available release and see if we have a build to use
+    if config.use_latest_build
+        && version.build.is_none()
+        && let Ok(release) = fetch_release("ruby", &version)
+        && let Some(build_id) = release.builds.keys().next()
+    {
+        output.version = Some(VersionSpec::parse(format!("{version}+{build_id}"))?);
+    }
+
+    Ok(Json(output))
 }
 
 #[plugin_fn]
@@ -69,15 +120,10 @@ pub fn build_instructions(
         return Err(PluginError::UnsupportedWindowsBuild.into());
     }
 
-    if let Some(asset) = load_prebuilt_asset(env, &version)? {
-        return Ok(Json(BuildInstructionsOutput {
-            source: Some(SourceLocation::Archive(ArchiveSource {
-                url: asset.url,
-                prefix: Some(format!("ruby-{version}")),
-            })),
-            ..Default::default()
-        }));
-    }
+    let ruby_version = match version.as_version() {
+        Some(version) => to_ruby_version(version),
+        None => version.to_string(),
+    };
 
     let output = BuildInstructionsOutput {
         help_url: Some(
@@ -126,7 +172,7 @@ pub fn build_instructions(
             })),
             BuildInstruction::RunCommand(Box::new(CommandInstruction::with_builder(
                 "ruby-build",
-                ["--verbose", version.to_string().as_str(), "."],
+                ["--verbose", ruby_version.as_str(), "."],
             ))),
         ],
         ..Default::default()
@@ -140,17 +186,30 @@ pub fn download_prebuilt(
     Json(input): Json<DownloadPrebuiltInput>,
 ) -> FnResult<Json<DownloadPrebuiltOutput>> {
     let env = get_host_environment()?;
-    let version = &input.context.version;
+    let spec = &input.context.version;
 
-    let Some(asset) = load_prebuilt_asset(env, version)? else {
-        return Err(plugin_err!(
-            "No pre-built available for <hash>{version}</hash> on <id>{}-{}</id>! Try building from source with <shell>--build</shell>.",
+    let make_error = || {
+        plugin_err!(
+            "No pre-built available for <hash>{spec}</hash> on <id>{}-{}</id>! Try building from source with <shell>--build</shell>.",
             env.os,
             env.arch,
-        ));
+        )
     };
 
-    Ok(Json(create_download_output(asset, version)))
+    let Some(version) = spec.as_version() else {
+        return Err(make_error());
+    };
+
+    let release = fetch_release("ruby", version)?;
+
+    let Some(mut output) = release.create_download_prebuilt(env, version) else {
+        return Err(make_error());
+    };
+
+    // Does not include the build suffix!
+    output.archive_prefix = Some(format!("ruby-{}", to_ruby_version(version)));
+
+    Ok(Json(output))
 }
 
 #[plugin_fn]

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.5
+
+#### 🚀 Updates
+
+- Updated to support moon v2.6 release.
+
+## 1.0.4
+
+#### 🚀 Updates
+
+- Updated the embedded `bun` tool to support Windows arm64 (Bun v1.3.10+) and
+  musl based Linux (Bun v1.1.35+).
+
 ## 1.0.3
 
 #### 🚀 Updates

@@ -1,6 +1,6 @@
 [package]
 name = "deno_tool"
-version = "0.15.11"
+version = "0.15.12"
 edition = "2024"
 description = "Deno WASM plugin for proto."
 authors = ["Miles Johnson"]
@@ -19,10 +19,13 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 tool_common = { path = "../../crates/tool-common" }
+lang_javascript_common = { path = "../../crates/lang-javascript-common" }
 extism-pdk = { workspace = true }
+nodejs_package_json = { workspace = true }
 proto_pdk = { workspace = true }
 schematic = { workspace = true }
 serde = { workspace = true }
+starbase_utils = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 proto_pdk_test_utils = { workspace = true }
